@@ -16,12 +16,12 @@ class BenchmarkClient(threading.Thread):
 
     def run(self):
         try:
-            from bert_serving.client import BertClient
+            from bert_serving.client import bert_client
         except ImportError:
             raise ImportError('BertClient module is not available, it is required for benchmarking.'
                               'Please use "pip install -U bert-serving-client" to install it.')
-        with BertClient(port=self.port, port_out=self.port_out,
-                        show_server_config=True, check_version=False, check_length=False) as bc:
+        with bert_client(port=self.port, port_out=self.port_out,
+                         show_server_config=True, check_version=False, check_length=False) as bc:
             time_all = []
             for _ in range(self.num_repeat):
                 start_t = time.perf_counter()

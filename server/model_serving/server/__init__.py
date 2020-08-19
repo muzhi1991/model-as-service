@@ -446,7 +446,7 @@ class SinkJob:
             x = self.final_ndarray
         x_info = {'dtype': str(x.dtype),
                   'shape': x.shape,
-                  'tokens': list(chain.from_iterable(self.tokens)) if self.with_tokens else ''}
+                  'extra_infos': list(chain.from_iterable(self.tokens)) if self.with_tokens else ''}
 
         x_info = jsonapi.dumps(x_info)
         return x, x_info

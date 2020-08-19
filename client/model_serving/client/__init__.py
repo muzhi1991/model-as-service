@@ -6,7 +6,6 @@ import sys
 import threading
 import time
 import uuid
-import warnings
 from collections import namedtuple
 from functools import wraps
 
@@ -14,25 +13,33 @@ import numpy as np
 import zmq
 from zmq.utils import jsonapi
 
-__all__ = ['__version__', 'BertClient', 'ConcurrentBertClient']
+__all__ = ['__version__', 'BaseClient', 'ConcurrentBaseClient']
 
 # in the future client version must match with server version
-__version__ = '1.10.0'
+__version__ = '0.0.1'
 
 if sys.version_info >= (3, 0):
     from ._py3_var import *
 else:
     from ._py2_var import *
 
+# 从服务端返回的数据结构，
+# send_multipart 结构是 [client_addr, x_info, x, req_id]，x_info可以解析为json
+# id是req_id， content是[client_addr, x_info, x, req_id]
 _Response = namedtuple('_Response', ['id', 'content'])
-Response = namedtuple('Response', ['id', 'embedding', 'tokens'])
+# 解析上面的结构中的content：
+# outputs为x（一个numpy ndarray，结构在x_info['shape'] x_info['dtype']中定义
+# extra_infos也在x_info['extra_infos']中
+Response = namedtuple('Response', ['id', 'outputs', 'extra_infos'])
 
 
-class BertClient(object):
+class BaseClient(object):
     def __init__(self, ip='localhost', port=5555, port_out=5556,
-                 output_fmt='ndarray', show_server_config=False,
-                 identity=None, check_version=True, check_length=True,
-                 check_token_info=True, ignore_all_checks=False,
+                 output_fmt='ndarray',
+                 show_server_config=False,
+                 identity=None,
+                 check_version=True,
+                 ignore_all_checks=False,
                  timeout=-1):
         """ A client object connected to a BertServer
 
@@ -52,8 +59,6 @@ class BertClient(object):
 
         :type timeout: int
         :type check_version: bool
-        :type check_length: bool
-        :type check_token_info: bool
         :type ignore_all_checks: bool
         :type identity: str
         :type show_server_config: bool
@@ -101,29 +106,24 @@ class BertClient(object):
         self.port = port
         self.port_out = port_out
         self.ip = ip
-        self.length_limit = 0
-        self.token_info_available = False
+        self.check_version = check_version
 
-        if not ignore_all_checks and (check_version or show_server_config or check_length or check_token_info):
+        if not ignore_all_checks and (check_version or show_server_config):
             s_status = self.server_config
 
-            if check_version and s_status['server_version'] != self.status['client_version']:
+            if check_version and s_status['server_version'] != self.client_status['client_version']:
                 raise AttributeError('version mismatch! server version is %s but client version is %s!\n'
-                                     'consider "pip install -U bert-serving-server bert-serving-client"\n'
-                                     'or disable version-check by "BertClient(check_version=False)"' % (
-                                         s_status['server_version'], self.status['client_version']))
-
-            if check_length:
-                if s_status['max_seq_len'] is not None:
-                    self.length_limit = int(s_status['max_seq_len'])
-                else:
-                    self.length_limit = None
-
-            if check_token_info:
-                self.token_info_available = bool(s_status['show_tokens_to_client'])
+                                     'consider "pip install -U model-serving-server model-serving-client"\n'
+                                     'or disable version-check by "BaseClient(check_version=False)"' % (
+                                         s_status['server_version'], self.client_status['client_version']))
 
             if show_server_config:
                 self._print_dict(s_status, 'server config:')
+
+            self.check_status(s_status)
+
+    def check_status(self, s_status):
+        pass
 
     def close(self):
         """
@@ -135,9 +135,10 @@ class BertClient(object):
         self.receiver.close()
         self.context.term()
 
-    def _send(self, msg, msg_len=0):
+    def _send(self, msg: bytes, msg_len: int = 0, extra_params: bytes = b''):
         self.request_id += 1
-        self.sender.send_multipart([self.identity, msg, b'%d' % self.request_id, b'%d' % msg_len])
+        # 发送n个二进制数据 http://wiki.zeromq.org/blog:zero-copy
+        self.sender.send_multipart([self.identity, msg, b'%d' % self.request_id, b'%d' % msg_len, extra_params])
         self.pending_request.add(self.request_id)
         return self.request_id
 
@@ -168,12 +169,14 @@ class BertClient(object):
 
     def _recv_ndarray(self, wait_for_req_id=None):
         request_id, response = self._recv(wait_for_req_id)
+        # response : [client_addr, x_info, x, req_id]
         arr_info, arr_val = jsonapi.loads(response[1]), response[2]
+        # todo _buffer--memoryview的作用，防止内存拷贝
         X = np.frombuffer(_buffer(arr_val), dtype=str(arr_info['dtype']))
-        return Response(request_id, self.formatter(X.reshape(arr_info['shape'])), arr_info.get('tokens', ''))
+        return Response(request_id, self.formatter(X.reshape(arr_info['shape'])), arr_info.get('extra_infos', ''))
 
     @property
-    def status(self):
+    def client_status(self):
         """
             Get the status of this BertClient instance
 
@@ -245,8 +248,8 @@ class BertClient(object):
         return jsonapi.loads(self._recv(req_id).content[1])
 
     @_timeout
-    def encode(self, texts, blocking=True, is_tokenized=False, show_tokens=False):
-        """ Encode a list of strings to a list of vectors
+    def infer(self, inputs, blocking=True):
+        """ infer a list of input to a list of vectors
 
         `texts` should be a list of strings, each of which represents a sentence.
         If `is_tokenized` is set to True, then `texts` should be list[list[str]],
@@ -281,35 +284,13 @@ class BertClient(object):
         :rtype: numpy.ndarray or list[list[float]]
 
         """
-        if is_tokenized:
-            self._check_input_lst_lst_str(texts)
-        else:
-            self._check_input_lst_str(texts)
+        self._check_input_lst(inputs)
 
-        if self.length_limit is None:
-            warnings.warn('server does not put a restriction on "max_seq_len", '
-                          'it will determine "max_seq_len" dynamically according to the sequences in the batch. '
-                          'you can restrict the sequence length on the client side for better efficiency')
-        elif self.length_limit and not self._check_length(texts, self.length_limit, is_tokenized):
-            warnings.warn('some of your sentences have more tokens than "max_seq_len=%d" set on the server, '
-                          'as consequence you may get less-accurate or truncated embeddings.\n'
-                          'here is what you can do:\n'
-                          '- disable the length-check by create a new "BertClient(check_length=False)" '
-                          'when you do not want to display this warning\n'
-                          '- or, start a new server with a larger "max_seq_len"' % self.length_limit)
-
-        req_id = self._send(jsonapi.dumps(texts), len(texts))
+        req_id = self._send(jsonapi.dumps(inputs), len(inputs))
         if not blocking:
             return None
         r = self._recv_ndarray(req_id)
-        if self.token_info_available and show_tokens:
-            return r.embedding, r.tokens
-        elif not self.token_info_available and show_tokens:
-            warnings.warn('"show_tokens=True", but the server does not support showing tokenization info to clients.\n'
-                          'here is what you can do:\n'
-                          '- start a new server with "bert-serving-start -show_tokens_to_client ..."\n'
-                          '- or, use "encode(show_tokens=False)"')
-        return r.embedding
+        return r.outputs, r.extra_infos
 
     def fetch(self, delay=.0):
         """ Fetch the encoded vectors from server, use it with `encode(blocking=False)`
@@ -347,7 +328,7 @@ class BertClient(object):
             tmp = list(self.fetch())
             if sort:
                 tmp = sorted(tmp, key=lambda v: v.id)
-            tmp = [v.embedding for v in tmp]
+            tmp = [v.outputs for v in tmp]
             if concat:
                 if self.output_fmt == 'ndarray':
                     tmp = np.concatenate(tmp, axis=0)
@@ -355,7 +336,7 @@ class BertClient(object):
                     tmp = [vv for v in tmp for vv in v]
             return tmp
 
-    def encode_async(self, batch_generator, max_num_batch=None, delay=0.1, **kwargs):
+    def infer_async(self, batch_generator, max_num_batch=None, delay=0.1, **kwargs):
         """ Async encode batches from a generator
 
         :param delay: delay in seconds and then run fetcher
@@ -369,8 +350,8 @@ class BertClient(object):
 
         def run():
             cnt = 0
-            for texts in batch_generator:
-                self.encode(texts, blocking=False, **kwargs)
+            for inputs in batch_generator:
+                self.infer(inputs, blocking=False, **kwargs)
                 cnt += 1
                 if max_num_batch and cnt == max_num_batch:
                     break
@@ -380,39 +361,9 @@ class BertClient(object):
         return self.fetch(delay)
 
     @staticmethod
-    def _check_length(texts, len_limit, tokenized):
-        if tokenized:
-            # texts is already tokenized as list of str
-            return all(len(t) <= len_limit for t in texts)
-        else:
-            # do a simple whitespace tokenizer
-            return all(len(t.split()) <= len_limit for t in texts)
-
-    @staticmethod
-    def _check_input_lst_str(texts):
-        if not isinstance(texts, list):
-            raise TypeError('"%s" must be %s, but received %s' % (texts, type([]), type(texts)))
-        if not len(texts):
-            raise ValueError(
-                '"%s" must be a non-empty list, but received %s with %d elements' % (texts, type(texts), len(texts)))
-        for idx, s in enumerate(texts):
-            if not isinstance(s, _str):
-                raise TypeError('all elements in the list must be %s, but element %d is %s' % (type(''), idx, type(s)))
-            if not s.strip():
-                raise ValueError(
-                    'all elements in the list must be non-empty string, but element %d is %s' % (idx, repr(s)))
-            if _py2:
-                texts[idx] = _unicode(texts[idx])
-
-    @staticmethod
-    def _check_input_lst_lst_str(texts):
-        if not isinstance(texts, list):
-            raise TypeError('"texts" must be %s, but received %s' % (type([]), type(texts)))
-        if not len(texts):
-            raise ValueError(
-                '"texts" must be a non-empty list, but received %s with %d elements' % (type(texts), len(texts)))
-        for s in texts:
-            BertClient._check_input_lst_str(s)
+    def _check_input_lst(inputs):
+        if not isinstance(inputs, list):
+            raise TypeError('"%s" must be %s, but received %s' % (inputs, type([]), type(inputs)))
 
     @staticmethod
     def _print_dict(x, title=None):
@@ -441,7 +392,7 @@ class BCManager():
         self.available_bc.append(self.bc)
 
 
-class ConcurrentBertClient(BertClient):
+class ConcurrentBaseClient(BaseClient):
     def __init__(self, max_concurrency=10, **kwargs):
         """ A thread-safe client object connected to a BertServer
 
@@ -454,14 +405,14 @@ class ConcurrentBertClient(BertClient):
 
         """
         try:
-            from bert_serving.client import BertClient
+            from model_serving.client import BaseClient
         except ImportError:
             raise ImportError('BertClient module is not available, it is required for serving HTTP requests.'
                               'Please use "pip install -U bert-serving-client" to install it.'
                               'If you do not want to use it as an HTTP server, '
                               'then remove "-http_port" from the command line.')
 
-        self.available_bc = [BertClient(**kwargs) for _ in range(max_concurrency)]
+        self.available_bc = [BaseClient(**kwargs) for _ in range(max_concurrency)]
         self.max_concurrency = max_concurrency
 
     def close(self):
@@ -484,7 +435,7 @@ class ConcurrentBertClient(BertClient):
         return arg_wrapper
 
     @_concurrent
-    def encode(self, **kwargs):
+    def infer(self, **kwargs):
         pass
 
     @property
@@ -499,14 +450,14 @@ class ConcurrentBertClient(BertClient):
 
     @property
     @_concurrent
-    def status(self):
+    def client_status(self):
         pass
 
     def fetch(self, **kwargs):
-        raise NotImplementedError('Async encoding of "ConcurrentBertClient" is not implemented yet')
+        raise NotImplementedError('Async encoding of "ConcurrentBaseClient" is not implemented yet')
 
     def fetch_all(self, **kwargs):
-        raise NotImplementedError('Async encoding of "ConcurrentBertClient" is not implemented yet')
+        raise NotImplementedError('Async encoding of "ConcurrentBaseClient" is not implemented yet')
 
-    def encode_async(self, **kwargs):
-        raise NotImplementedError('Async encoding of "ConcurrentBertClient" is not implemented yet')
+    def infer_async(self, **kwargs):
+        raise NotImplementedError('Async encoding of "ConcurrentBaseClient" is not implemented yet')
