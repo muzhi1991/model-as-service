@@ -13,10 +13,10 @@
 import sys
 import time
 
-from bert_serving.client import BertClient
+from model_serving.client import bert_client
 
 if __name__ == '__main__':
-    bc = BertClient(port=int(sys.argv[1]), port_out=int(sys.argv[2]), show_server_config=True)
+    bc = bert_client(port=int(sys.argv[1]), port_out=int(sys.argv[2]), show_server_config=True)
     # encode a list of strings
     with open('README.md') as fp:
         data = [v for v in fp if v.strip()][:512]

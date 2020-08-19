@@ -147,8 +147,8 @@ docker run --runtime nvidia -dit -p 5555:5555 -p 5556:5556 -v $PATH_MODEL:/model
 #### 3. Use Client to Get Sentence Encodes
 Now you can encode sentences simply as follows:
 ```python
-from bert_serving.client import BertClient
-bc = BertClient()
+from model_serving.client import bert_client
+bc = bert_client()
 bc.encode(['First do it', 'then do it right', 'then do it better'])
 ```
 It will return a `ndarray` (or `List[List[float]]` if you wish), in which each row is a fixed-length vector representing a sentence. Having thousands of sentences? Just `encode`! *Don't even bother to batch*, the server will take care of it.
@@ -166,8 +166,8 @@ One may also start the service on one (GPU) machine and call it from another (CP
 
 ```python
 # on another CPU machine
-from bert_serving.client import BertClient
-bc = BertClient(ip='xx.xx.xx.xx')  # ip address of the GPU machine
+from model_serving.client import bert_client
+bc = bert_client(ip='xx.xx.xx.xx')  # ip address of the GPU machine
 bc.encode(['First do it', 'then do it right', 'then do it better'])
 ```
 
@@ -698,8 +698,8 @@ Finally, one may also config CORS to restrict the public access of the server by
 
 Besides shell, one can also start a `BertServer` from python. Simply do
 ```python
-from bert_serving.server.helper import get_args_parser
-from bert_serving.server import BertServer
+from model_serving.server.helper import get_args_parser
+from model_serving.server import BertServer
 args = get_args_parser().parse_args(['-model_dir', 'YOUR_MODEL_PATH_HERE',
                                      '-port', '5555',
                                      '-port_out', '5556',

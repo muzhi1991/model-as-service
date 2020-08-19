@@ -12,7 +12,7 @@
 
 import sys
 
-from bert_serving.client import BertClient
+from model_serving.client import bert_client
 
 
 def send_without_block(bc, data, repeat=10):
@@ -24,7 +24,7 @@ def send_without_block(bc, data, repeat=10):
 
 
 if __name__ == '__main__':
-    bc = BertClient(port=int(sys.argv[1]), port_out=int(sys.argv[2]))
+    bc = bert_client(port=int(sys.argv[1]), port_out=int(sys.argv[2]))
     num_repeat = 20
 
     with open('README.md') as fp:

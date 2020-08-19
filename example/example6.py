@@ -14,14 +14,14 @@ import os
 
 import GPUtil
 import tensorflow as tf
-from bert_serving.client import BertClient
+from model_serving.client import bert_client
 
 os.environ['CUDA_VISIBLE_DEVICES'] = str(GPUtil.getFirstAvailable()[0])
 tf.logging.set_verbosity(tf.logging.INFO)
 
 with open('README.md') as fp:
     data = [v for v in fp if v.strip()]
-    bc = BertClient()
+    bc = bert_client()
     list_vec = bc.encode(data)
     list_label = [0 for _ in data]  # a dummy list of all-zero labels
 

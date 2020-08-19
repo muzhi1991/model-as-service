@@ -16,9 +16,9 @@ from collections import namedtuple
 import numpy as np
 import pandas as pd
 # from MulticoreTSNE import MulticoreTSNE as TSNE
-from bert_serving.client import BertClient
-from bert_serving.server import BertServer
-from bert_serving.server.helper import get_args_parser
+from model_serving.client import bert_client
+from model_serving.server import BertServer
+from model_serving.server.helper import get_args_parser
 from matplotlib import pyplot as plt
 from matplotlib.colors import ListedColormap
 from sklearn.decomposition import PCA
@@ -82,7 +82,7 @@ for pool_layer in range(1, 13):
     print('wait until server is ready...')
     time.sleep(20)
     print('encoding...')
-    bc = BertClient(port=port, port_out=port_out, show_server_config=True)
+    bc = bert_client(port=port, port_out=port_out, show_server_config=True)
     subset_vec_all_layers.append(bc.encode(subset_text))
     bc.close()
     server.close()

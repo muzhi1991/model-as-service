@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 # Han Xiao <artex.xh@gmail.com> <https://hanxiao.github.io>
+import functools
 import multiprocessing
 import os
 import random
@@ -11,7 +12,6 @@ from collections import defaultdict
 from datetime import datetime
 from itertools import chain
 from multiprocessing import Process
-from multiprocessing.pool import Pool
 
 import numpy as np
 import zmq
@@ -23,8 +23,8 @@ from .helper import *
 from .http import BertHTTPProxy
 from .zmq_decor import multi_socket
 
-__all__ = ['__version__', 'BertServer']
-__version__ = '1.10.0'
+__all__ = ['__version__', 'BaseServer']
+__version__ = '0.0.1'
 
 _tf_ver_ = check_tf_version()
 
@@ -34,7 +34,8 @@ class ServerCmd:
     show_config = b'SHOW_CONFIG'
     show_status = b'SHOW_STATUS'
     new_job = b'REGISTER'
-    data_token = b'TOKENS'
+    # data_token = b'TOKENS'
+    extra_data_single = b'EXTRA_SINGLE'
     data_embed = b'EMBEDDINGS'
 
     @staticmethod
@@ -42,13 +43,11 @@ class ServerCmd:
         return any(not k.startswith('__') and v == cmd for k, v in vars(ServerCmd).items())
 
 
-class BertServer(threading.Thread):
+class BaseServer(threading.Thread):
     def __init__(self, args):
         super().__init__()
         self.logger = set_logger(colored('VENTILATOR', 'magenta'), args.verbose)
 
-        self.model_dir = args.model_dir
-        self.max_seq_len = args.max_seq_len
         self.num_worker = args.num_worker
         self.max_batch_size = args.max_batch_size
         self.num_concurrent_socket = max(8, args.num_worker * 2)  # optimize concurrency for multi-clients
@@ -64,18 +63,15 @@ class BertServer(threading.Thread):
             'server_start_time': str(datetime.now()),
         }
         self.processes = []
-        self.logger.info('freeze, optimize and export graph, could take a while...')
-        with Pool(processes=1) as pool:
-            # optimize the graph, must be done in another process
-            from .graph import optimize_graph
-            self.graph_path, self.bert_config = pool.apply(optimize_graph, (self.args,))
-        # from .graph import optimize_graph
-        # self.graph_path = optimize_graph(self.args, self.logger)
+        self.graph_path, self.config = self.load_graph_config()
         if self.graph_path:
             self.logger.info('optimized graph is stored at: %s' % self.graph_path)
         else:
             raise FileNotFoundError('graph optimization fails and returns empty result')
         self.is_ready = threading.Event()
+
+    def load_graph_config(self):
+        raise Exception("subclass should implement")
 
     def __enter__(self):
         self.start()
@@ -95,7 +91,7 @@ class BertServer(threading.Thread):
     @zmqd.socket(zmq.PUSH)
     def _send_close_signal(self, _, frontend):
         frontend.connect('tcp://localhost:%d' % self.port)
-        frontend.send_multipart([b'0', ServerCmd.terminate, b'0', b'0'])
+        frontend.send_multipart([b'', ServerCmd.terminate, b'', b'', b''])
 
     @staticmethod
     def shutdown(args):
@@ -104,12 +100,18 @@ class BertServer(threading.Thread):
             with ctx.socket(zmq.PUSH) as frontend:
                 try:
                     frontend.connect('tcp://%s:%d' % (args.ip, args.port))
-                    frontend.send_multipart([b'0', ServerCmd.terminate, b'0', b'0'])
+                    frontend.send_multipart([b'', ServerCmd.terminate, b'', b'', b''])
                     print('shutdown signal sent to %d' % args.port)
                 except zmq.error.Again:
                     raise TimeoutError(
                         'no response from the server (with "timeout"=%d ms), please check the following:'
                         'is the server still online? is the network broken? are "port" correct? ' % args.timeout)
+
+    def create_sink(self, addr_front2sink, config):
+        return BaseSink(self.args, addr_front2sink, config)
+
+    def create_worker(self, idx, addr_backend_list, addr_sink, device_id, graph_path, config):
+        return BaseWorker(idx, self.args, addr_backend_list, addr_sink, device_id, graph_path, config)
 
     def run(self):
         self._run()
@@ -120,10 +122,10 @@ class BertServer(threading.Thread):
     @multi_socket(zmq.PUSH, num_socket='num_concurrent_socket')
     def _run(self, _, frontend, sink, *backend_socks):
 
-        def push_new_job(_job_id, _json_msg, _msg_len):
+        def push_new_job(_job_id, _json_msg, _msg_len, _extra_params):
             # backend_socks[0] is always at the highest priority
             _sock = backend_socks[0] if _msg_len <= self.args.priority_batch_size else rand_backend_socket
-            _sock.send_multipart([_job_id, _json_msg])
+            _sock.send_multipart([_job_id, _json_msg, _extra_params])
 
         # bind all sockets
         self.logger.info('bind all sockets')
@@ -134,7 +136,8 @@ class BertServer(threading.Thread):
 
         # start the sink process
         self.logger.info('start the sink')
-        proc_sink = BertSink(self.args, addr_front2sink, self.bert_config)
+        # proc_sink = BaseSink(self.args, addr_front2sink, self.bert_config)
+        proc_sink = self.create_sink(addr_front2sink, self.config)
         self.processes.append(proc_sink)
         proc_sink.start()
         addr_sink = sink.recv().decode('ascii')
@@ -142,8 +145,9 @@ class BertServer(threading.Thread):
         # start the backend processes
         device_map = self._get_device_map()
         for idx, device_id in enumerate(device_map):
-            process = BertWorker(idx, self.args, addr_backend_list, addr_sink, device_id,
-                                 self.graph_path, self.bert_config)
+            process = self.create_worker(idx, addr_backend_list, addr_sink, device_id, self.graph_path, self.config)
+            # process = BaseWorker(idx, self.args, addr_backend_list, addr_sink, device_id,
+            #                      self.graph_path, self.bert_config)
             self.processes.append(process)
             process.start()
 
@@ -166,7 +170,8 @@ class BertServer(threading.Thread):
         while True:
             try:
                 request = frontend.recv_multipart()
-                client, msg, req_id, msg_len = request
+                client, msg, req_id, msg_len, extra_params = request
+                # todo add extra_params
                 assert req_id.isdigit()
                 assert msg_len.isdigit()
             except (ValueError, AssertionError):
@@ -210,9 +215,9 @@ class BertServer(threading.Thread):
                         job_gen = ((job_id + b'@%d' % i, seqs[i:(i + self.max_batch_size)]) for i in
                                    range(0, int(msg_len), self.max_batch_size))
                         for partial_job_id, job in job_gen:
-                            push_new_job(partial_job_id, jsonapi.dumps(job), len(job))
+                            push_new_job(partial_job_id, jsonapi.dumps(job), len(job), extra_params)
                     else:
-                        push_new_job(job_id, msg, int(msg_len))
+                        push_new_job(job_id, msg, int(msg_len), extra_params)
 
         for p in self.processes:
             p.close()
@@ -256,19 +261,30 @@ class BertServer(threading.Thread):
         return device_map
 
 
-class BertSink(Process):
-    def __init__(self, args, front_sink_addr, bert_config):
+class BaseSink(Process):
+    def __init__(self, args, front_sink_addr, config):
         super().__init__()
+        self.args = args
+        self.config = config
         self.port = args.port_out
         self.exit_flag = multiprocessing.Event()
         self.logger = set_logger(colored('SINK', 'green'), args.verbose)
         self.front_sink_addr = front_sink_addr
         self.verbose = args.verbose
-        self.show_tokens_to_client = args.show_tokens_to_client
-        self.max_seq_len = args.max_seq_len
-        self.max_position_embeddings = bert_config.max_position_embeddings
-        self.fixed_embed_length = args.fixed_embed_length
+        # self.show_tokens_to_client = args.show_tokens_to_client
+        # self.max_seq_len = args.max_seq_len
+        # self.max_position_embeddings = bert_config.max_position_embeddings
+        # self.fixed_embed_length = args.fixed_embed_length
         self.is_ready = multiprocessing.Event()
+        #
+        # self.graph_path, self.config = self.load_graph_config()
+        # if self.graph_path:
+        #     self.logger.info('optimized graph is stored at: %s' % self.graph_path)
+        # else:
+        #     raise FileNotFoundError('graph optimization fails and returns empty result')
+
+    def create_sink_job(self, args, config):
+        return SinkJob(args, config)
 
     def close(self):
         self.logger.info('shutting down...')
@@ -289,9 +305,7 @@ class BertSink(Process):
         frontend.connect(self.front_sink_addr)
         sender.bind('tcp://*:%d' % self.port)
 
-        pending_jobs = defaultdict(lambda: SinkJob(self.max_seq_len, self.max_position_embeddings,
-                                                   self.show_tokens_to_client,
-                                                   self.fixed_embed_length))  # type: Dict[str, SinkJob]
+        pending_jobs = defaultdict(lambda: self.create_sink_job(self.args, self.config))  # type: Dict[str, SinkJob]
 
         poller = zmq.Poller()
         poller.register(frontend, zmq.POLLIN)
@@ -320,17 +334,17 @@ class BertSink(Process):
                     # parsing the ndarray
                     arr_info, arr_val = jsonapi.loads(msg[1]), msg[2]
                     x = np.frombuffer(memoryview(arr_val), dtype=arr_info['dtype']).reshape(arr_info['shape'])
-                    pending_jobs[job_id].add_embed(x, partial_id)
-                elif msg[3] == ServerCmd.data_token:
+                    pending_jobs[job_id].add_array(x, partial_id)
+                elif msg[3] == ServerCmd.extra_data_single:
                     x = jsonapi.loads(msg[1])
-                    pending_jobs[job_id].add_token(x, partial_id)
+                    pending_jobs[job_id].add_extra_single(x, partial_id)
                 else:
                     logger.error('received a wrongly-formatted request (expected 4 frames, got %d)' % len(msg))
                     logger.error('\n'.join('field %d: %s' % (idx, k) for idx, k in enumerate(msg)), exc_info=True)
 
                 logger.info('collect %s %s (E:%d/T:%d/A:%d)' % (msg[3], job_id,
                                                                 pending_jobs[job_id].progress_embeds,
-                                                                pending_jobs[job_id].progress_tokens,
+                                                                pending_jobs[job_id].progress_extras,
                                                                 pending_jobs[job_id].checksum))
 
             if socks.get(frontend) == zmq.POLLIN:
@@ -340,9 +354,9 @@ class BertSink(Process):
                     # register a new job
                     pending_jobs[job_info].checksum = int(msg_info)
                     logger.info('job register\tsize: %d\tjob id: %s' % (int(msg_info), job_info))
-                    if len(pending_jobs[job_info]._pending_embeds)>0 \
+                    if len(pending_jobs[job_info]._pending_embeds) > 0 \
                             and pending_jobs[job_info].final_ndarray is None:
-                        pending_jobs[job_info].add_embed(None, 0)
+                        pending_jobs[job_info].add_array(None, 0)
                 elif msg_type == ServerCmd.show_config or msg_type == ServerCmd.show_status:
                     time.sleep(0.1)  # dirty fix of slow-joiner: sleep so that client receiver can connect.
                     logger.info('send config\tclient %s' % client_addr)
@@ -361,24 +375,26 @@ class BertSink(Process):
 
 
 class SinkJob:
-    def __init__(self, max_seq_len, max_position_embeddings, with_tokens, fixed_embed_length):
+    def __init__(self, cmd_args, model_config):
+        self.cmd_args = cmd_args
+        self.model_config = model_config
         self._pending_embeds = []
-        self.tokens = []
-        self.tokens_ids = []
+        self.extra_datas = []
+        self.extra_datas_ids = []
         self.checksum = 0
         self.final_ndarray = None
-        self.progress_tokens = 0
+        self.progress_extras = 0
         self.progress_embeds = 0
-        self.with_tokens = with_tokens
-        self.max_seq_len_unset = max_seq_len is None
-        self.max_position_embeddings = max_position_embeddings
+        self.with_extras = False
+        # self.max_seq_len_unset = max_seq_len is None
+        # self.max_position_embeddings = max_position_embeddings
         self.max_effective_len = 0
-        self.fixed_embed_length = fixed_embed_length
+        # self.fixed_embed_length = fixed_embed_length
 
     def clear(self):
         self._pending_embeds.clear()
-        self.tokens_ids.clear()
-        self.tokens.clear()
+        self.extra_datas_ids.clear()
+        self.extra_datas.clear()
         del self.final_ndarray
 
     def _insert(self, data, pid, data_lst, idx_lst):
@@ -393,13 +409,14 @@ class SinkJob:
         idx_lst.insert(lo, pid)
         data_lst.insert(lo, data)
 
-    def add_embed(self, data, pid):
+    def add_array(self, data, pid):
         def fill_data():
             self.final_ndarray[pid: (pid + data.shape[0]), 0:data.shape[1]] = data
             self.progress_embeds += progress
             if data.shape[1] > self.max_effective_len:
                 self.max_effective_len = data.shape[1]
-        if data is not None: # when job finish msg come to SINK earlier than job register
+
+        if data is not None:  # when job finish msg come to SINK earlier than job register
             progress = data.shape[0]
         else:
             progress = 0
@@ -407,60 +424,77 @@ class SinkJob:
             self._pending_embeds.append((data, pid, progress))
         else:
             if self.final_ndarray is None:
-                if data is not None: # when job finish msg come to SINK earlier than job register
+                if data is not None:  # when job finish msg come to SINK earlier than job register
                     d_shape = list(data.shape[1:])
                 else:
                     d_shape = list(self._pending_embeds[0][0].shape[1:])
-                if self.max_seq_len_unset and len(d_shape) > 1:
-                    # if not set max_seq_len, then we have no choice but set result ndarray to
-                    # [B, max_position_embeddings, dim] and truncate it at the end
-                    d_shape[0] = self.max_position_embeddings
+                # if self.max_seq_len_unset and len(d_shape) > 1:
+                #     # if not set max_seq_len, then we have no choice but set result ndarray to
+                #     # [B, max_position_embeddings, dim] and truncate it at the end
+                #     d_shape[0] = self.max_position_embeddings
+                d_shape = self.reset_array_element_shape(d_shape)
                 if data is not None:
                     dtype = data.dtype
                 else:
                     dtype = self._pending_embeds[0][0].dtype
                 self.final_ndarray = np.zeros([self.checksum] + d_shape, dtype=dtype)
-            if data is not None: # when job finish msg come to SINK earlier than job register
+            if data is not None:  # when job finish msg come to SINK earlier than job register
                 fill_data()
             while self._pending_embeds:
                 data, pid, progress = self._pending_embeds.pop()
                 fill_data()
 
-    def add_token(self, data, pid):
+    def add_extra_single(self, data, pid):
         progress = len(data)
-        self._insert(data, pid, self.tokens, self.tokens_ids)
-        self.progress_tokens += progress
+        self._insert(data, pid, self.extra_datas, self.extra_datas_ids)
+        self.progress_extras += progress
 
     @property
     def is_done(self):
-        if self.with_tokens:
-            return self.checksum > 0 and self.checksum == self.progress_tokens and self.checksum == self.progress_embeds
+        if self.with_extras:
+            return self.checksum > 0 and self.checksum == self.progress_extras and self.checksum == self.progress_embeds
         else:
             return self.checksum > 0 and self.checksum == self.progress_embeds
 
+    def reset_array_element_shape(self, d_shape):
+        """
+        根据第一条数据的shape，是否需要修改每个返回结果的shape，
+        :param d_shape:第一条数据不包括batch_size的shape，(seq长度，embedding长度)
+        :return:
+        """
+        # # bert中未设置一致的seq长度，
+        # if self.cmd_args.max_seq_len is None and len(d_shape) > 1:
+        #     # if not set max_seq_len, then we have no choice but set result ndarray to
+        #     # [B, max_position_embeddings, dim] and truncate it at the end
+        #     d_shape[0] = self.model_config.max_position_embeddings
+        return d_shape
+
+    def post_process(self, final_ndarray):
+        return final_ndarray
+        # if self.max_seq_len_unset and not self.fixed_embed_length:
+        #     # https://zhuanlan.zhihu.com/p/59767914
+        #     x = np.ascontiguousarray(final_ndarray[:, 0:self.max_effective_len])
+        # return x
+
     @property
     def result(self):
-        if self.max_seq_len_unset and not self.fixed_embed_length:
-            x = np.ascontiguousarray(self.final_ndarray[:, 0:self.max_effective_len])
-        else:
-            x = self.final_ndarray
+        x = self.post_process(self.final_ndarray)
         x_info = {'dtype': str(x.dtype),
                   'shape': x.shape,
-                  'extra_infos': list(chain.from_iterable(self.tokens)) if self.with_tokens else ''}
+                  'extra_infos': list(chain.from_iterable(self.extra_datas)) if self.with_extras else ''}
 
         x_info = jsonapi.dumps(x_info)
         return x, x_info
 
 
-class BertWorker(Process):
+class BaseWorker(Process):
     def __init__(self, id, args, worker_address_list, sink_address, device_id, graph_path, graph_config):
         super().__init__()
         self.worker_id = id
         self.device_id = device_id
         self.logger = set_logger(colored('WORKER-%d' % self.worker_id, 'yellow'), args.verbose)
-        self.max_seq_len = args.max_seq_len
-        self.do_lower_case = args.do_lower_case
-        self.mask_cls_sep = args.mask_cls_sep
+        self.args = args
+
         self.daemon = True
         self.exit_flag = multiprocessing.Event()
         self.worker_address = worker_address_list
@@ -468,13 +502,10 @@ class BertWorker(Process):
         self.sink_address = sink_address
         self.prefetch_size = args.prefetch_size if self.device_id > 0 else None  # set to zero for CPU-worker
         self.gpu_memory_fraction = args.gpu_memory_fraction
-        self.model_dir = args.model_dir
         self.verbose = args.verbose
         self.graph_path = graph_path
-        self.bert_config = graph_config
+        self.config = graph_config
         self.use_fp16 = args.fp16
-        self.show_tokens_to_client = args.show_tokens_to_client
-        self.no_special_token = args.no_special_token
         self.is_ready = multiprocessing.Event()
 
     def close(self):
@@ -485,36 +516,11 @@ class BertWorker(Process):
         self.join()
         self.logger.info('terminated!')
 
-    def get_estimator(self, tf):
-        from tensorflow.python.estimator.estimator import Estimator
-        from tensorflow.python.estimator.run_config import RunConfig
-        from tensorflow.python.estimator.model_fn import EstimatorSpec
+    def init(self):
+        pass
 
-        def model_fn(features, labels, mode, params):
-            with tf.gfile.GFile(self.graph_path, 'rb') as f:
-                graph_def = tf.GraphDef()
-                graph_def.ParseFromString(f.read())
-
-            input_names = ['input_ids', 'input_mask', 'input_type_ids']
-
-            output = tf.import_graph_def(graph_def,
-                                         input_map={k + ':0': features[k] for k in input_names},
-                                         return_elements=['final_encodes:0'])
-
-            return EstimatorSpec(mode=mode, predictions={
-                'client_id': features['client_id'],
-                'encodes': output[0]
-            })
-
-        config = tf.ConfigProto(device_count={'GPU': 0 if self.device_id < 0 else 1})
-        config.gpu_options.allow_growth = True
-        config.gpu_options.per_process_gpu_memory_fraction = self.gpu_memory_fraction
-        config.log_device_placement = False
-        # session-wise XLA doesn't seem to work on tf 1.10
-        # if args.xla:
-        #     config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
-
-        return Estimator(model_fn=model_fn, config=RunConfig(session_config=config))
+    def infer_loop(self, feature_generator, sink_embed, logger):
+        raise Exception("subclass should implement")
 
     def run(self):
         self._run()
@@ -530,72 +536,75 @@ class BertWorker(Process):
         logger.info('use device %s, load graph from %s' %
                     ('cpu' if self.device_id < 0 else ('gpu: %d' % self.device_id), self.graph_path))
 
-        tf = import_tf(self.device_id, self.verbose, use_fp16=self.use_fp16)
-        estimator = self.get_estimator(tf)
-
         for sock, addr in zip(receivers, self.worker_address):
             sock.connect(addr)
 
         sink_embed.connect(self.sink_address)
         sink_token.connect(self.sink_address)
-        for r in estimator.predict(self.input_fn_builder(receivers, tf, sink_token), yield_single_examples=False):
-            send_ndarray(sink_embed, r['client_id'], r['encodes'], ServerCmd.data_embed)
-            logger.info('job done\tsize: %s\tclient: %s' % (r['encodes'].shape, r['client_id']))
+        self.init()
 
-    def input_fn_builder(self, socks, tf, sink):
-        from .bert.extract_features import convert_lst_to_features
-        from .bert.tokenization import FullTokenizer
+        def feature_generator():
+            yield from map(lambda d: self.to_features(d[0], d[1], d[2],logger=logger, sink=sink_token),
+                           self.socks_gen(receivers, logger))
 
-        def gen():
-            # Windows does not support logger in MP environment, thus get a new logger
-            # inside the process for better compatibility
-            logger = set_logger(colored('WORKER-%d' % self.worker_id, 'yellow'), self.verbose)
-            tokenizer = FullTokenizer(vocab_file=os.path.join(self.model_dir, 'vocab.txt'), do_lower_case=self.do_lower_case)
+        # feature_generator = lambda : yield from map(functools.partial(self.to_features, logger=logger, sink=sink_token),
+        #                         self.socks_gen(receivers, logger))
 
-            poller = zmq.Poller()
-            for sock in socks:
-                poller.register(sock, zmq.POLLIN)
+        self.infer_loop(feature_generator, sink_embed, logger)
 
-            logger.info('ready and listening!')
-            self.is_ready.set()
 
-            while not self.exit_flag.is_set():
-                events = dict(poller.poll())
-                for sock_idx, sock in enumerate(socks):
-                    if sock in events:
-                        client_id, raw_msg = sock.recv_multipart()
-                        msg = jsonapi.loads(raw_msg)
-                        logger.info('new job\tsocket: %d\tsize: %d\tclient: %s' % (sock_idx, len(msg), client_id))
-                        # check if msg is a list of list, if yes consider the input is already tokenized
-                        is_tokenized = all(isinstance(el, list) for el in msg)
-                        tmp_f = list(convert_lst_to_features(msg, self.max_seq_len,
-                                                             self.bert_config.max_position_embeddings,
-                                                             tokenizer, logger,
-                                                             is_tokenized, self.mask_cls_sep, self.no_special_token))
-                        if self.show_tokens_to_client:
-                            sink.send_multipart([client_id, jsonapi.dumps([f.tokens for f in tmp_f]),
-                                                 b'', ServerCmd.data_token])
-                        yield {
-                            'client_id': client_id,
-                            'input_ids': [f.input_ids for f in tmp_f],
-                            'input_mask': [f.input_mask for f in tmp_f],
-                            'input_type_ids': [f.input_type_ids for f in tmp_f]
-                        }
+    def socks_gen(self, socks, logger):
+        poller = zmq.Poller()
+        for sock in socks:
+            poller.register(sock, zmq.POLLIN)
+        logger.info('ready and listening!')
+        self.is_ready.set()
+        while not self.exit_flag.is_set():
+            events = dict(poller.poll())
+            for sock_idx, sock in enumerate(socks):
+                if sock in events:
+                    client_id, raw_msg, extra_params=sock.recv_multipart()
+                    yield client_id, raw_msg, extra_params
 
-        def input_fn():
-            return (tf.data.Dataset.from_generator(
-                gen,
-                output_types={'input_ids': tf.int32,
-                              'input_mask': tf.int32,
-                              'input_type_ids': tf.int32,
-                              'client_id': tf.string},
-                output_shapes={
-                    'client_id': (),
-                    'input_ids': (None, None),
-                    'input_mask': (None, None),
-                    'input_type_ids': (None, None)}).prefetch(self.prefetch_size))
-
-        return input_fn
+    def to_features(self, client_id, raw_msg, extra_params, logger, sink):
+        raise Exception("subclass should implement")
+    #     from .bert.tokenization import FullTokenizer
+    #     from .bert.extract_features import convert_lst_to_features
+    #     config = self.config
+    #     args = self.args
+    #     model_dir = args.model_dir
+    #     max_seq_len = args.max_seq_len
+    #     do_lower_case = args.do_lower_case
+    #     mask_cls_sep = args.mask_cls_sep
+    #     no_special_token = args.no_special_token
+    #
+    #     msg = jsonapi.loads(raw_msg)
+    #     # fixme 放到外部
+    #     tokenizer = FullTokenizer(vocab_file=os.path.join(model_dir, 'vocab.txt'),
+    #                               do_lower_case=do_lower_case)
+    #     # check if msg is a list of list, if yes consider the input is already tokenized
+    #     is_tokenized = all(isinstance(el, list) for el in msg)
+    #     tmp_f = list(convert_lst_to_features(msg, max_seq_len,
+    #                                          config.max_position_embeddings,
+    #                                          tokenizer, logger,
+    #                                          is_tokenized, mask_cls_sep, no_special_token))
+    #     # if self.show_tokens_to_client:
+    #     #     sink.send_multipart([client_id, jsonapi.dumps([f.tokens for f in tmp_f]),
+    #     #                          b'', ServerCmd.extra_data_single])
+    #     return {
+    #         'client_id': client_id,
+    #         'input_ids': [f.input_ids for f in tmp_f],
+    #         'input_mask': [f.input_mask for f in tmp_f],
+    #         'input_type_ids': [f.input_type_ids for f in tmp_f]
+    #     }
+    #
+    # def get_feature_types(self):
+    #     # fixme tf should in class
+    #     raise Exception("subclass should implement")
+    #
+    #
+    # def get_feature_shapes(self):
+    #     raise Exception("subclass should implement")
 
 
 class ServerStatistic:
@@ -611,7 +620,7 @@ class ServerStatistic:
         self._num_last_two_req = 200
 
     def update(self, request):
-        client, msg, req_id, msg_len = request
+        client, msg, req_id, msg_len,extra_params = request
         self._hist_client[client] += 1
         if ServerCmd.is_valid(msg):
             self._num_sys_req += 1
@@ -651,7 +660,7 @@ class ServerStatistic:
 
         avg_msg_len = None
         if len(self._hist_msg_len) > 0:
-            avg_msg_len = sum(k*v for k,v in self._hist_msg_len.items()) / sum(self._hist_msg_len.values())
+            avg_msg_len = sum(k * v for k, v in self._hist_msg_len.items()) / sum(self._hist_msg_len.values())
 
         parts = [{
             'num_data_request': self._num_data_req,
